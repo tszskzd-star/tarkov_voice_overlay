@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: tarkov-voice-overlay-coordinator
+    runtime: go
+    rootDir: coordinator
+    plan: free
+    buildCommand: go build -o tvo-coordinator .
+    startCommand: ./tvo-coordinator
+    healthCheckPath: /healthz
+    autoDeploy: true

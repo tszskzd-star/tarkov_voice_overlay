@@ -1,0 +1,11 @@
+Public coordinator template:
+wss://your-host.example/ws
+
+Health check template:
+https://your-host.example/healthz
+
+Set the client variable before starting:
+set TVO_COORDINATOR_URL=wss://your-host.example/ws
+
+Optional private room password:
+set TVO_ROOM_PASSWORD=change-this-locally

@@ -1,0 +1,16 @@
+build/
+build-*/
+.cache/
+dist/
+run-logs/
+.vs/
+out/
+*.user
+*.suo
+*.obj
+*.pdb
+*.ilk
+*.exe
+*.dll
+*.log
+*.zip

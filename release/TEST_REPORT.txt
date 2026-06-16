@@ -1,0 +1,18 @@
+Tarkov Voice Overlay test report
+
+Build:
+- Go coordinator built successfully: tvo-coordinator.exe
+- C++20 client built successfully with CMake + Ninja + WinLibs MinGW: tarkov_voice_overlay.exe
+
+Tests:
+- go test ./...: passed
+- CTest tvo_core_tests: passed
+- Client smoke run: passed
+- Local coordinator health check http://127.0.0.1:8080/healthz: 200 ok
+- Overlay mode can run and auto-exit under TVO_SMOKE_EXIT_MS: passed
+- Overlay close button closes the client process: passed
+- Microphone record/playback test button: build check passed
+
+Notes:
+- Public server addresses and private room passwords should be configured
+  locally through environment variables, not committed into the repository.

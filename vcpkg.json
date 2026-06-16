@@ -1,0 +1,19 @@
+{
+  "name": "tarkov-voice-overlay",
+  "version-string": "0.1.0",
+  "dependencies": [
+    {
+      "name": "imgui",
+      "features": [
+        "dx11-binding",
+        "win32-binding"
+      ]
+    },
+    "ixwebsocket",
+    "libnice",
+    "libsodium",
+    "nlohmann-json",
+    "opus",
+    "portaudio"
+  ]
+}
