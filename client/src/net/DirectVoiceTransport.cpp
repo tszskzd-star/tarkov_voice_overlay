@@ -832,11 +832,14 @@ struct DirectVoiceTransport::Impl {
         int pingPacketsReceived = 0;
         int voicePacketsSent = 0;
         int voicePacketsReceived = 0;
+        int duplicateVoicePacketsDropped = 0;
         int candidateSignalsSent = 0;
+        std::uint32_t lastVoiceSequenceReceived = 0;
         Clock::time_point createdAt = Clock::now();
         Clock::time_point lastPingSent = Clock::time_point{};
         Clock::time_point lastHeard = Clock::time_point{};
         Clock::time_point lastCandidateSignalSent = Clock::time_point{};
+        bool hasLastVoiceSequenceReceived = false;
     };
 
     SignalCallback signalCallback;
@@ -1214,12 +1217,11 @@ struct DirectVoiceTransport::Impl {
 
         if (route.learnedEndpoint) {
             sendOne(*route.learnedEndpoint);
+            return;
         }
 
         for (const auto& endpoint : route.endpoints) {
-            if (!route.learnedEndpoint || !sameEndpoint(endpoint, *route.learnedEndpoint)) {
-                sendOne(endpoint);
-            }
+            sendOne(endpoint);
         }
 #endif
     }
@@ -1278,6 +1280,19 @@ struct DirectVoiceTransport::Impl {
             }
 
             if (decoded->type == kPacketVoice && frameCallback) {
+                if (route.hasLastVoiceSequenceReceived &&
+                    decoded->sequence <= route.lastVoiceSequenceReceived) {
+                    route.duplicateVoicePacketsDropped += 1;
+                    if (route.duplicateVoicePacketsDropped <= 3 ||
+                        route.duplicateVoicePacketsDropped % 50 == 0) {
+                        appendP2PLog("dropped duplicate UDP voice from " +
+                            decoded->sourcePeerId +
+                            " seq=" + std::to_string(decoded->sequence));
+                    }
+                    continue;
+                }
+                route.hasLastVoiceSequenceReceived = true;
+                route.lastVoiceSequenceReceived = decoded->sequence;
                 route.voicePacketsReceived += 1;
                 if (route.voicePacketsReceived <= 3 || route.voicePacketsReceived % 50 == 0) {
                     appendP2PLog("received UDP voice from " + decoded->sourcePeerId +

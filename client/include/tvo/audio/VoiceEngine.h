@@ -6,6 +6,7 @@
 #include <deque>
 #include <fstream>
 #include <functional>
+#include <map>
 #include <vector>
 
 namespace tvo {
@@ -55,6 +56,14 @@ public:
 private:
     struct NativeAudioCapture;
     struct NativeAudioPlayback;
+    struct RemoteAudioState {
+        std::deque<std::vector<std::int16_t>> frames;
+        Clock::time_point lastReceived = Clock::now();
+        std::uint32_t lastSequence = 0;
+        bool hasLastSequence = false;
+    };
+
+    void pumpRemotePlayback();
 
     AudioSettings settings_{};
     VoiceTransport* transport_ = nullptr;
@@ -72,6 +81,8 @@ private:
     bool pushToTalkActive_ = false;
     bool transmitting_ = false;
     std::deque<std::vector<std::int16_t>> preSpeechFrames_;
+    std::map<PeerId, RemoteAudioState> remoteAudio_;
+    Clock::time_point lastRemoteMix_ = Clock::time_point{};
     Clock::time_point startedAt_ = Clock::now();
 };
 

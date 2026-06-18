@@ -29,6 +29,9 @@ constexpr int kWireVoiceSamplesPerFrame = kWireVoiceSampleRate * kWireVoiceFrame
 constexpr int kPreSpeechFrameCount = 6;
 constexpr int kVadHangoverPumpFrames = 45;
 constexpr int kPushToTalkTailPumpFrames = 12;
+constexpr int kRemotePlaybackIntervalMs = 18;
+constexpr std::size_t kMaxRemoteFramesPerPeer = 6;
+constexpr std::size_t kMaxPendingPlaybackBuffers = 12;
 
 void appendVoiceLog(const std::string& line) {
     std::error_code ignored;
@@ -575,6 +578,10 @@ struct VoiceEngine::NativeAudioPlayback {
         }
 
         cleanup(false);
+        if (pending_.size() >= kMaxPendingPlaybackBuffers) {
+            waveOutReset(handle_);
+            cleanup(true);
+        }
 
         auto pending = std::make_unique<PendingBuffer>();
         const std::size_t samples = frame.payload.size() / sizeof(std::int16_t);
@@ -593,7 +600,7 @@ struct VoiceEngine::NativeAudioPlayback {
             pending_.push_back(std::move(pending));
         }
 
-        if (pending_.size() > 80) {
+        if (pending_.size() > kMaxPendingPlaybackBuffers) {
             cleanup(true);
         }
     }
@@ -679,6 +686,8 @@ bool VoiceEngine::start() {
     pushToTalkActive_ = false;
     transmitting_ = false;
     preSpeechFrames_.clear();
+    remoteAudio_.clear();
+    lastRemoteMix_ = Clock::time_point{};
     metrics_ = VoiceMetrics{};
     micLogCounter_ = 0;
     std::error_code ignored;
@@ -721,6 +730,8 @@ void VoiceEngine::stop() {
     pushToTalkTailFrames_ = 0;
     transmitting_ = false;
     preSpeechFrames_.clear();
+    remoteAudio_.clear();
+    lastRemoteMix_ = Clock::time_point{};
     if (micLog_) {
         micLog_.flush();
         micLog_.close();
@@ -740,10 +751,65 @@ void VoiceEngine::setPushToTalkActive(bool active) {
     pushToTalkActive_ = active;
 }
 
+void VoiceEngine::pumpRemotePlayback() {
+    if (nativePlayback_ == nullptr || remoteAudio_.empty()) {
+        return;
+    }
+
+    const auto now = Clock::now();
+    if (lastRemoteMix_ != Clock::time_point{} &&
+        now - lastRemoteMix_ < std::chrono::milliseconds(kRemotePlaybackIntervalMs)) {
+        return;
+    }
+    lastRemoteMix_ = now;
+
+    std::vector<int> mixed(kWireVoiceSamplesPerFrame, 0);
+    std::size_t activeFrames = 0;
+
+    for (auto it = remoteAudio_.begin(); it != remoteAudio_.end();) {
+        auto& state = it->second;
+        if (state.frames.empty() && now - state.lastReceived > std::chrono::seconds(2)) {
+            it = remoteAudio_.erase(it);
+            continue;
+        }
+
+        if (!state.frames.empty()) {
+            auto frame = std::move(state.frames.front());
+            state.frames.pop_front();
+            const std::size_t samples = std::min(frame.size(), mixed.size());
+            for (std::size_t i = 0; i < samples; ++i) {
+                mixed[i] += frame[i];
+            }
+            ++activeFrames;
+        }
+        ++it;
+    }
+
+    if (activeFrames == 0) {
+        return;
+    }
+
+    const float scale = activeFrames > 1
+        ? 1.0f / std::sqrt(static_cast<float>(activeFrames))
+        : 1.0f;
+    std::vector<std::int16_t> output(kWireVoiceSamplesPerFrame, 0);
+    for (std::size_t i = 0; i < output.size(); ++i) {
+        const int scaled = static_cast<int>(static_cast<float>(mixed[i]) * scale);
+        output[i] = static_cast<std::int16_t>(std::clamp(scaled, -32768, 32767));
+    }
+
+    EncodedVoiceFrame mixedFrame;
+    mixedFrame.payload.resize(output.size() * sizeof(std::int16_t));
+    std::memcpy(mixedFrame.payload.data(), output.data(), mixedFrame.payload.size());
+    nativePlayback_->play(mixedFrame);
+}
+
 void VoiceEngine::pump() {
     if (!running_) {
         return;
     }
+
+    pumpRemotePlayback();
 
     if (metrics_.muted) {
         metrics_.micLevel = 0.0f;
@@ -857,13 +923,35 @@ void VoiceEngine::playRemoteFrame(const EncodedVoiceFrame& frame) {
     if (!running_ || nativePlayback_ == nullptr || frame.payload.empty()) {
         return;
     }
+    if (frame.payload.size() < sizeof(std::int16_t)) {
+        return;
+    }
+
+    const PeerId sourcePeerId = frame.sourcePeerId.empty() ? "_unknown" : frame.sourcePeerId;
+    auto& remote = remoteAudio_[sourcePeerId];
+    if (remote.hasLastSequence && frame.sequence <= remote.lastSequence) {
+        metrics_.droppedFrames += 1;
+        return;
+    }
+    remote.hasLastSequence = true;
+    remote.lastSequence = frame.sequence;
+    remote.lastReceived = Clock::now();
+
+    const std::size_t samples = frame.payload.size() / sizeof(std::int16_t);
+    std::vector<std::int16_t> pcm(samples);
+    std::memcpy(pcm.data(), frame.payload.data(), pcm.size() * sizeof(std::int16_t));
+    remote.frames.push_back(std::move(pcm));
+    while (remote.frames.size() > kMaxRemoteFramesPerPeer) {
+        remote.frames.pop_front();
+        metrics_.droppedFrames += 1;
+    }
+
     ++receivedLogCounter_;
     if (receivedLogCounter_ <= 3 || receivedLogCounter_ % 50 == 0) {
         appendVoiceLog("received voice frame seq=" + std::to_string(frame.sequence) +
             " bytes=" + std::to_string(frame.payload.size()) +
             " from=" + frame.sourcePeerId);
     }
-    nativePlayback_->play(frame);
 }
 
 }  // namespace tvo
