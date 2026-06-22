@@ -4,6 +4,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <limits>
@@ -23,7 +24,7 @@ namespace tvo {
 
 namespace {
 
-constexpr int kWireVoiceSampleRate = 16000;
+constexpr int kWireVoiceSampleRate = 24000;
 constexpr int kWireVoiceFrameMs = 20;
 constexpr int kWireVoiceSamplesPerFrame = kWireVoiceSampleRate * kWireVoiceFrameMs / 1000;
 constexpr int kPreSpeechFrameCount = 6;
@@ -35,6 +36,20 @@ constexpr std::size_t kMaxPendingPlaybackBuffers = 18;
 constexpr float kSoftLimitKnee = 0.82f;
 constexpr float kSoftLimitCeiling = 0.98f;
 constexpr float kRemoteMixPeakTarget = 28000.0f;
+constexpr std::array<std::uint8_t, 4> kAdpcmMagic{'T', 'V', 'A', '1'};
+constexpr std::array<int, 16> kImaIndexTable{
+    -1, -1, -1, -1, 2, 4, 6, 8,
+    -1, -1, -1, -1, 2, 4, 6, 8};
+constexpr std::array<int, 89> kImaStepTable{
+    7, 8, 9, 10, 11, 12, 13, 14, 16, 17,
+    19, 21, 23, 25, 28, 31, 34, 37, 41, 45,
+    50, 55, 60, 66, 73, 80, 88, 97, 107, 118,
+    130, 143, 157, 173, 190, 209, 230, 253, 279, 307,
+    337, 371, 408, 449, 494, 544, 598, 658, 724, 796,
+    876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066,
+    2272, 2499, 2749, 3024, 3327, 3660, 4026, 4428, 4871, 5358,
+    5894, 6484, 7132, 7845, 8630, 9493, 10442, 11487, 12635, 13899,
+    15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767};
 
 void appendVoiceLog(const std::string& line) {
     std::error_code ignored;
@@ -75,6 +90,175 @@ bool audibleVoiceFrame(const std::vector<std::int16_t>& samples) {
     return peak >= 900 || rms >= 260.0;
 }
 
+bool voiceCodecDisabled() {
+    const char* value = std::getenv("TVO_DISABLE_VOICE_CODEC");
+    return value != nullptr && std::string(value) == "1";
+}
+
+void appendLeU16(std::vector<std::uint8_t>& out, std::uint16_t value) {
+    out.push_back(static_cast<std::uint8_t>(value & 0xff));
+    out.push_back(static_cast<std::uint8_t>((value >> 8) & 0xff));
+}
+
+std::uint16_t readLeU16(const std::vector<std::uint8_t>& data, std::size_t offset) {
+    return static_cast<std::uint16_t>(data[offset] | (data[offset + 1] << 8));
+}
+
+std::vector<std::int16_t> normalizeFrameSamples(const std::vector<std::int16_t>& samples) {
+    if (samples.empty() || samples.size() == kWireVoiceSamplesPerFrame) {
+        return samples;
+    }
+
+    std::vector<std::int16_t> out(kWireVoiceSamplesPerFrame, 0);
+    if (samples.size() == 1) {
+        std::fill(out.begin(), out.end(), samples.front());
+        return out;
+    }
+
+    const double scale = static_cast<double>(samples.size() - 1) /
+        static_cast<double>(kWireVoiceSamplesPerFrame - 1);
+    for (std::size_t i = 0; i < out.size(); ++i) {
+        const double source = static_cast<double>(i) * scale;
+        const auto left = static_cast<std::size_t>(source);
+        const std::size_t right = std::min(left + 1, samples.size() - 1);
+        const float t = static_cast<float>(source - static_cast<double>(left));
+        const float value = static_cast<float>(samples[left]) * (1.0f - t) +
+            static_cast<float>(samples[right]) * t;
+        out[i] = softLimitSample(value);
+    }
+    return out;
+}
+
+std::vector<std::uint8_t> encodeAdpcmPayload(const std::vector<std::int16_t>& input) {
+    const auto samples = normalizeFrameSamples(input);
+    if (samples.empty() || samples.size() > 0xffff) {
+        return {};
+    }
+
+    std::vector<std::uint8_t> out;
+    out.reserve(9 + samples.size() / 2);
+    out.insert(out.end(), kAdpcmMagic.begin(), kAdpcmMagic.end());
+    appendLeU16(out, static_cast<std::uint16_t>(samples.front()));
+    out.push_back(0);
+    appendLeU16(out, static_cast<std::uint16_t>(samples.size()));
+
+    int predictor = samples.front();
+    int index = 0;
+    bool lowNibble = true;
+    std::uint8_t packed = 0;
+
+    for (std::size_t i = 1; i < samples.size(); ++i) {
+        int step = kImaStepTable[static_cast<std::size_t>(index)];
+        int diff = static_cast<int>(samples[i]) - predictor;
+        int code = 0;
+        if (diff < 0) {
+            code = 8;
+            diff = -diff;
+        }
+
+        int tempStep = step;
+        if (diff >= tempStep) {
+            code |= 4;
+            diff -= tempStep;
+        }
+        tempStep >>= 1;
+        if (diff >= tempStep) {
+            code |= 2;
+            diff -= tempStep;
+        }
+        tempStep >>= 1;
+        if (diff >= tempStep) {
+            code |= 1;
+        }
+
+        int delta = step >> 3;
+        if ((code & 4) != 0) {
+            delta += step;
+        }
+        if ((code & 2) != 0) {
+            delta += step >> 1;
+        }
+        if ((code & 1) != 0) {
+            delta += step >> 2;
+        }
+        predictor += (code & 8) != 0 ? -delta : delta;
+        predictor = std::clamp(predictor, -32768, 32767);
+        index = std::clamp(index + kImaIndexTable[static_cast<std::size_t>(code & 0x0f)], 0, 88);
+
+        if (lowNibble) {
+            packed = static_cast<std::uint8_t>(code & 0x0f);
+            lowNibble = false;
+        } else {
+            packed |= static_cast<std::uint8_t>((code & 0x0f) << 4);
+            out.push_back(packed);
+            packed = 0;
+            lowNibble = true;
+        }
+    }
+
+    if (!lowNibble) {
+        out.push_back(packed);
+    }
+    return out;
+}
+
+bool decodeAdpcmPayload(const std::vector<std::uint8_t>& payload, std::vector<std::int16_t>& out) {
+    if (payload.size() < 9 ||
+        !std::equal(kAdpcmMagic.begin(), kAdpcmMagic.end(), payload.begin())) {
+        return false;
+    }
+
+    int predictor = static_cast<std::int16_t>(readLeU16(payload, 4));
+    int index = std::clamp(static_cast<int>(payload[6]), 0, 88);
+    const std::uint16_t sampleCount = readLeU16(payload, 7);
+    if (sampleCount == 0) {
+        return false;
+    }
+
+    out.clear();
+    out.reserve(sampleCount);
+    out.push_back(static_cast<std::int16_t>(predictor));
+
+    for (std::size_t byteIndex = 9; byteIndex < payload.size() && out.size() < sampleCount; ++byteIndex) {
+        const std::uint8_t byte = payload[byteIndex];
+        for (int half = 0; half < 2 && out.size() < sampleCount; ++half) {
+            const int code = half == 0 ? (byte & 0x0f) : ((byte >> 4) & 0x0f);
+            const int step = kImaStepTable[static_cast<std::size_t>(index)];
+            int delta = step >> 3;
+            if ((code & 4) != 0) {
+                delta += step;
+            }
+            if ((code & 2) != 0) {
+                delta += step >> 1;
+            }
+            if ((code & 1) != 0) {
+                delta += step >> 2;
+            }
+
+            predictor += (code & 8) != 0 ? -delta : delta;
+            predictor = std::clamp(predictor, -32768, 32767);
+            index = std::clamp(index + kImaIndexTable[static_cast<std::size_t>(code & 0x0f)], 0, 88);
+            out.push_back(static_cast<std::int16_t>(predictor));
+        }
+    }
+
+    return out.size() == sampleCount;
+}
+
+std::vector<std::int16_t> decodeVoicePayload(const std::vector<std::uint8_t>& payload) {
+    std::vector<std::int16_t> samples;
+    if (decodeAdpcmPayload(payload, samples)) {
+        return normalizeFrameSamples(samples);
+    }
+
+    const std::size_t sampleCount = payload.size() / sizeof(std::int16_t);
+    samples.resize(sampleCount);
+    if (sampleCount > 0) {
+        std::memcpy(samples.data(), payload.data(), sampleCount * sizeof(std::int16_t));
+    }
+    return normalizeFrameSamples(samples);
+}
+
 }  // namespace
 
 #ifdef TVO_PLATFORM_WINDOWS
@@ -85,7 +269,7 @@ struct VoiceEngine::NativeAudioCapture {
             return true;
         }
 
-        for (int sampleRate : {48000, 44100}) {
+        for (int sampleRate : {48000, 44100, 16000}) {
             if (openWaveIn(sampleRate)) {
                 return true;
             }
@@ -443,6 +627,8 @@ private:
 
     bool openWaveIn(int sampleRate) {
         waveInSampleRate_ = sampleRate;
+        resampleSource_.clear();
+        resamplePosition_ = 0.0;
 
         WAVEFORMATEX format{};
         format.wFormatTag = WAVE_FORMAT_PCM;
@@ -535,9 +721,40 @@ private:
             return;
         }
 
-        pcmAccumulator_.reserve(pcmAccumulator_.size() + sampleCount);
-        for (std::size_t i = 0; i < sampleCount; ++i) {
-            pcmAccumulator_.push_back(softLimitSample(static_cast<float>(samples[i]) * inputGain_));
+        auto appendWireSample = [this](float sample) {
+            pcmAccumulator_.push_back(softLimitSample(sample * inputGain_));
+        };
+
+        if (waveInSampleRate_ == kWireVoiceSampleRate) {
+            pcmAccumulator_.reserve(pcmAccumulator_.size() + sampleCount);
+            for (std::size_t i = 0; i < sampleCount; ++i) {
+                appendWireSample(static_cast<float>(samples[i]));
+            }
+        } else {
+            resampleSource_.reserve(resampleSource_.size() + sampleCount);
+            for (std::size_t i = 0; i < sampleCount; ++i) {
+                resampleSource_.push_back(samples[i]);
+            }
+
+            const double step = static_cast<double>(waveInSampleRate_) /
+                static_cast<double>(kWireVoiceSampleRate);
+            while (resamplePosition_ + 1.0 < static_cast<double>(resampleSource_.size())) {
+                const auto left = static_cast<std::size_t>(resamplePosition_);
+                const std::size_t right = std::min(left + 1, resampleSource_.size() - 1);
+                const float t = static_cast<float>(resamplePosition_ - static_cast<double>(left));
+                const float sample = static_cast<float>(resampleSource_[left]) * (1.0f - t) +
+                    static_cast<float>(resampleSource_[right]) * t;
+                appendWireSample(sample);
+                resamplePosition_ += step;
+            }
+
+            const auto consumed = static_cast<std::size_t>(resamplePosition_);
+            if (consumed > 0) {
+                resampleSource_.erase(
+                    resampleSource_.begin(),
+                    resampleSource_.begin() + static_cast<std::ptrdiff_t>(consumed));
+                resamplePosition_ -= static_cast<double>(consumed);
+            }
         }
 
         while (pcmAccumulator_.size() >= kWireVoiceSamplesPerFrame) {
@@ -573,7 +790,9 @@ private:
     std::array<WAVEHDR, 4> headers_{};
     std::array<float, kSpectrumBands> lastSpectrum_{};
     std::vector<std::int16_t> pcmAccumulator_;
+    std::vector<std::int16_t> resampleSource_;
     std::vector<std::vector<std::int16_t>> pendingVoiceFrames_;
+    double resamplePosition_ = 0.0;
     int waveInSampleRate_ = 16000;
     float inputGain_ = 1.0f;
     float currentLevel_ = 0.0f;
@@ -924,8 +1143,17 @@ void VoiceEngine::pump() {
         EncodedVoiceFrame frame;
         frame.sequence = sequence_++;
         frame.captureUnixMs = elapsed;
-        frame.payload.resize(pcmFrame.size() * sizeof(std::int16_t));
-        std::memcpy(frame.payload.data(), pcmFrame.data(), frame.payload.size());
+        if (voiceCodecDisabled()) {
+            const auto samples = normalizeFrameSamples(pcmFrame);
+            frame.payload.resize(samples.size() * sizeof(std::int16_t));
+            std::memcpy(frame.payload.data(), samples.data(), frame.payload.size());
+        } else {
+            frame.payload = encodeAdpcmPayload(pcmFrame);
+        }
+        if (frame.payload.empty()) {
+            metrics_.droppedFrames += 1;
+            return;
+        }
         transport_->sendVoiceFrame(frame);
         metrics_.encodedFrames += 1;
         if (metrics_.encodedFrames <= 3 || metrics_.encodedFrames % 50 == 0) {
@@ -986,9 +1214,11 @@ void VoiceEngine::playRemoteFrame(const EncodedVoiceFrame& frame) {
     remote.lastSequence = frame.sequence;
     remote.lastReceived = Clock::now();
 
-    const std::size_t samples = frame.payload.size() / sizeof(std::int16_t);
-    std::vector<std::int16_t> pcm(samples);
-    std::memcpy(pcm.data(), frame.payload.data(), pcm.size() * sizeof(std::int16_t));
+    std::vector<std::int16_t> pcm = decodeVoicePayload(frame.payload);
+    if (pcm.empty()) {
+        metrics_.droppedFrames += 1;
+        return;
+    }
     remote.frames.push_back(std::move(pcm));
     while (remote.frames.size() > kMaxRemoteFramesPerPeer) {
         remote.frames.pop_front();
