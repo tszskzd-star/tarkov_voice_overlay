@@ -10,7 +10,7 @@ struct SetupResult {
     bool accepted = false;
     std::string nick = "Player";
     int iconIndex = 0;
-    float vadThreshold = 0.02f;
+    float vadThreshold = 0.03f;
     float inputGain = 1.0f;
     bool pushToTalk = false;
     int pushToTalkVirtualKey = 0x56;

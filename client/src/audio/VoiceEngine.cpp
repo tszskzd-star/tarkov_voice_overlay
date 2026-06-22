@@ -27,11 +27,14 @@ constexpr int kWireVoiceSampleRate = 16000;
 constexpr int kWireVoiceFrameMs = 20;
 constexpr int kWireVoiceSamplesPerFrame = kWireVoiceSampleRate * kWireVoiceFrameMs / 1000;
 constexpr int kPreSpeechFrameCount = 6;
-constexpr int kVadHangoverPumpFrames = 45;
-constexpr int kPushToTalkTailPumpFrames = 12;
+constexpr int kVadHangoverPumpFrames = 28;
+constexpr int kPushToTalkTailPumpFrames = 8;
 constexpr int kRemotePlaybackIntervalMs = 18;
 constexpr std::size_t kMaxRemoteFramesPerPeer = 6;
-constexpr std::size_t kMaxPendingPlaybackBuffers = 12;
+constexpr std::size_t kMaxPendingPlaybackBuffers = 18;
+constexpr float kSoftLimitKnee = 0.82f;
+constexpr float kSoftLimitCeiling = 0.98f;
+constexpr float kRemoteMixPeakTarget = 28000.0f;
 
 void appendVoiceLog(const std::string& line) {
     std::error_code ignored;
@@ -40,6 +43,36 @@ void appendVoiceLog(const std::string& line) {
     if (out) {
         out << line << "\n";
     }
+}
+
+std::int16_t softLimitSample(float value) {
+    const float normalized = value / 32768.0f;
+    const float sign = normalized < 0.0f ? -1.0f : 1.0f;
+    const float magnitude = std::abs(normalized);
+    float limited = magnitude;
+    if (magnitude > kSoftLimitKnee) {
+        const float over = (magnitude - kSoftLimitKnee) / (1.0f - kSoftLimitKnee);
+        limited = kSoftLimitKnee + (1.0f - kSoftLimitKnee) * (1.0f - std::exp(-over));
+    }
+    limited = std::min(limited, kSoftLimitCeiling);
+    return static_cast<std::int16_t>(std::lround(sign * limited * 32767.0f));
+}
+
+bool audibleVoiceFrame(const std::vector<std::int16_t>& samples) {
+    if (samples.empty()) {
+        return false;
+    }
+
+    double sumSquares = 0.0;
+    int peak = 0;
+    for (const auto sample : samples) {
+        const int value = std::abs(static_cast<int>(sample));
+        peak = std::max(peak, value);
+        sumSquares += static_cast<double>(sample) * static_cast<double>(sample);
+    }
+
+    const double rms = std::sqrt(sumSquares / static_cast<double>(samples.size()));
+    return peak >= 900 || rms >= 260.0;
 }
 
 }  // namespace
@@ -504,8 +537,7 @@ private:
 
         pcmAccumulator_.reserve(pcmAccumulator_.size() + sampleCount);
         for (std::size_t i = 0; i < sampleCount; ++i) {
-            const int scaled = static_cast<int>(static_cast<float>(samples[i]) * inputGain_);
-            pcmAccumulator_.push_back(static_cast<std::int16_t>(std::clamp(scaled, -32768, 32767)));
+            pcmAccumulator_.push_back(softLimitSample(static_cast<float>(samples[i]) * inputGain_));
         }
 
         while (pcmAccumulator_.size() >= kWireVoiceSamplesPerFrame) {
@@ -588,8 +620,7 @@ struct VoiceEngine::NativeAudioPlayback {
         pending->samples.resize(samples);
         const auto* input = reinterpret_cast<const std::int16_t*>(frame.payload.data());
         for (std::size_t i = 0; i < samples; ++i) {
-            const int scaled = static_cast<int>(static_cast<float>(input[i]) * outputGain_);
-            pending->samples[i] = static_cast<std::int16_t>(std::clamp(scaled, -32768, 32767));
+            pending->samples[i] = softLimitSample(static_cast<float>(input[i]) * outputGain_);
         }
 
         pending->header.lpData = reinterpret_cast<LPSTR>(pending->samples.data());
@@ -688,6 +719,7 @@ bool VoiceEngine::start() {
     preSpeechFrames_.clear();
     remoteAudio_.clear();
     lastRemoteMix_ = Clock::time_point{};
+    remoteMixGain_ = 1.0f;
     metrics_ = VoiceMetrics{};
     micLogCounter_ = 0;
     std::error_code ignored;
@@ -732,6 +764,7 @@ void VoiceEngine::stop() {
     preSpeechFrames_.clear();
     remoteAudio_.clear();
     lastRemoteMix_ = Clock::time_point{};
+    remoteMixGain_ = 1.0f;
     if (micLog_) {
         micLog_.flush();
         micLog_.close();
@@ -776,6 +809,10 @@ void VoiceEngine::pumpRemotePlayback() {
         if (!state.frames.empty()) {
             auto frame = std::move(state.frames.front());
             state.frames.pop_front();
+            if (!audibleVoiceFrame(frame)) {
+                ++it;
+                continue;
+            }
             const std::size_t samples = std::min(frame.size(), mixed.size());
             for (std::size_t i = 0; i < samples; ++i) {
                 mixed[i] += frame[i];
@@ -789,13 +826,25 @@ void VoiceEngine::pumpRemotePlayback() {
         return;
     }
 
-    const float scale = activeFrames > 1
-        ? 1.0f / std::sqrt(static_cast<float>(activeFrames))
-        : 1.0f;
+    int peak = 0;
+    for (const auto sample : mixed) {
+        peak = std::max(peak, std::abs(sample));
+    }
+    float targetGain = activeFrames > 1
+        ? 0.72f / std::sqrt(static_cast<float>(activeFrames))
+        : 0.95f;
+    if (peak > 0) {
+        targetGain = std::min(targetGain, kRemoteMixPeakTarget / static_cast<float>(peak));
+    }
+    if (targetGain < remoteMixGain_) {
+        remoteMixGain_ = targetGain;
+    } else {
+        remoteMixGain_ += (targetGain - remoteMixGain_) * 0.15f;
+    }
+
     std::vector<std::int16_t> output(kWireVoiceSamplesPerFrame, 0);
     for (std::size_t i = 0; i < output.size(); ++i) {
-        const int scaled = static_cast<int>(static_cast<float>(mixed[i]) * scale);
-        output[i] = static_cast<std::int16_t>(std::clamp(scaled, -32768, 32767));
+        output[i] = softLimitSample(static_cast<float>(mixed[i]) * remoteMixGain_);
     }
 
     EncodedVoiceFrame mixedFrame;

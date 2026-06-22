@@ -64,7 +64,7 @@ struct PeerStatus {
 struct AudioSettings {
     std::string inputDeviceName;
     std::string outputDeviceName;
-    float vadThreshold = 0.02f;
+    float vadThreshold = 0.03f;
     float inputGain = 1.0f;
     float outputGain = 1.0f;
     bool pushToTalk = false;

@@ -83,6 +83,7 @@ private:
     std::deque<std::vector<std::int16_t>> preSpeechFrames_;
     std::map<PeerId, RemoteAudioState> remoteAudio_;
     Clock::time_point lastRemoteMix_ = Clock::time_point{};
+    float remoteMixGain_ = 1.0f;
     Clock::time_point startedAt_ = Clock::now();
 };
 
