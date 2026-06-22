@@ -262,9 +262,50 @@ std::vector<std::int16_t> decodeVoicePayload(const std::vector<std::uint8_t>& pa
 }  // namespace
 
 #ifdef TVO_PLATFORM_WINDOWS
+namespace {
+
+std::string wideToUtf8(const wchar_t* text) {
+    if (text == nullptr || *text == L'\0') {
+        return {};
+    }
+
+    const int required = WideCharToMultiByte(CP_UTF8, 0, text, -1, nullptr, 0, nullptr, nullptr);
+    if (required <= 1) {
+        return {};
+    }
+
+    std::string out(static_cast<std::size_t>(required), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, text, -1, out.data(), required, nullptr, nullptr);
+    if (!out.empty() && out.back() == '\0') {
+        out.pop_back();
+    }
+    return out;
+}
+
+UINT waveInDeviceIdForName(const std::string& inputDeviceName) {
+    if (inputDeviceName.empty()) {
+        return WAVE_MAPPER;
+    }
+
+    const UINT count = waveInGetNumDevs();
+    for (UINT index = 0; index < count; ++index) {
+        WAVEINCAPSW caps{};
+        if (waveInGetDevCapsW(index, &caps, sizeof(caps)) != MMSYSERR_NOERROR) {
+            continue;
+        }
+        if (wideToUtf8(caps.szPname) == inputDeviceName) {
+            return index;
+        }
+    }
+    return WAVE_MAPPER;
+}
+
+}  // namespace
+
 struct VoiceEngine::NativeAudioCapture {
-    bool start(float inputGain) {
+    bool start(float inputGain, const std::string& inputDeviceName) {
         inputGain_ = inputGain;
+        waveInDeviceId_ = waveInDeviceIdForName(inputDeviceName);
         if (openWaveIn(kWireVoiceSampleRate)) {
             return true;
         }
@@ -638,7 +679,7 @@ private:
         format.nBlockAlign = format.nChannels * format.wBitsPerSample / 8;
         format.nAvgBytesPerSec = format.nSamplesPerSec * format.nBlockAlign;
 
-        if (waveInOpen(&handle_, WAVE_MAPPER, &format, 0, 0, CALLBACK_NULL) != MMSYSERR_NOERROR) {
+        if (waveInOpen(&handle_, waveInDeviceId_, &format, 0, 0, CALLBACK_NULL) != MMSYSERR_NOERROR) {
             handle_ = nullptr;
             return false;
         }
@@ -794,6 +835,7 @@ private:
     std::vector<std::vector<std::int16_t>> pendingVoiceFrames_;
     double resamplePosition_ = 0.0;
     int waveInSampleRate_ = 16000;
+    UINT waveInDeviceId_ = WAVE_MAPPER;
     float inputGain_ = 1.0f;
     float currentLevel_ = 0.0f;
 };
@@ -888,7 +930,7 @@ private:
 };
 #else
 struct VoiceEngine::NativeAudioCapture {
-    bool start(float) {
+    bool start(float, const std::string&) {
         return false;
     }
     void stop() {}
@@ -949,7 +991,7 @@ bool VoiceEngine::start() {
     }
     delete nativeCapture_;
     nativeCapture_ = new NativeAudioCapture();
-    if (!nativeCapture_->start(settings_.inputGain)) {
+    if (!nativeCapture_->start(settings_.inputGain, settings_.inputDeviceName)) {
         delete nativeCapture_;
         nativeCapture_ = nullptr;
     }

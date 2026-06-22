@@ -6,9 +6,11 @@
 #include "tvo/net/DirectVoiceTransport.h"
 #include "tvo/net/LanDiscovery.h"
 #include "tvo/net/SignalingClient.h"
+#include "tvo/platform/AudioSettingsWindow.h"
 #include "tvo/platform/HotkeyManager.h"
 #include "tvo/platform/OverlayWindow.h"
 #include "tvo/platform/SetupWindow.h"
+#include "tvo/platform/TrayIcon.h"
 #include "tvo/security/PasswordGate.h"
 
 namespace tvo {
@@ -19,6 +21,7 @@ public:
 
 private:
     void handleSignalingEvent(const SignalingEvent& event);
+    void applyAudioSettings(const AudioSettings& audioSettings);
     void updateOverlay();
 
     AppSettings settings_{};
@@ -29,6 +32,8 @@ private:
     LanDiscovery lan_;
     OverlayWindow overlay_;
     HotkeyManager hotkeys_;
+    TrayIcon tray_;
+    AudioSettingsWindow audioSettingsWindow_;
     PasswordGate passwordGate_;
 };
 

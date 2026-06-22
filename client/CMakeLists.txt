@@ -6,9 +6,11 @@ set(TVO_CLIENT_SOURCES
     src/net/DirectVoiceTransport.cpp
     src/net/LanDiscovery.cpp
     src/net/SignalingClient.cpp
+    src/platform/AudioSettingsWindow.cpp
     src/platform/HotkeyManager.cpp
     src/platform/OverlayWindow.cpp
     src/platform/SetupWindow.cpp
+    src/platform/TrayIcon.cpp
     src/security/PasswordGate.cpp
 )
 

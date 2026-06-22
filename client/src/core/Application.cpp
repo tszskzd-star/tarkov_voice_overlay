@@ -1,9 +1,12 @@
 #include "tvo/core/Application.h"
 #include "tvo/net/IceConfig.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cctype>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <optional>
 #include <string>
@@ -33,6 +36,62 @@ std::optional<int> readPositiveEnvMs(const char* name) {
 bool envFlagEnabled(const char* name) {
     const char* value = std::getenv(name);
     return value != nullptr && std::string(value) == "1";
+}
+
+std::string trim(std::string text) {
+    auto notSpace = [](unsigned char c) { return c > ' '; };
+    text.erase(text.begin(), std::find_if(text.begin(), text.end(), notSpace));
+    text.erase(std::find_if(text.rbegin(), text.rend(), notSpace).base(), text.end());
+    return text;
+}
+
+std::filesystem::path savedAudioSettingsPath() {
+    return std::filesystem::current_path() / "tvo_client_settings.ini";
+}
+
+void loadSavedAudioSettings(AudioSettings& audio) {
+    std::ifstream in(savedAudioSettingsPath());
+    if (!in) {
+        return;
+    }
+
+    std::string line;
+    while (std::getline(in, line)) {
+        const auto split = line.find('=');
+        if (split == std::string::npos) {
+            continue;
+        }
+
+        const std::string key = trim(line.substr(0, split));
+        const std::string value = trim(line.substr(split + 1));
+        try {
+            if (key == "inputDeviceName") {
+                audio.inputDeviceName = value;
+            } else if (key == "vadThreshold") {
+                audio.vadThreshold = std::stof(value);
+            } else if (key == "inputGain") {
+                audio.inputGain = std::stof(value);
+            } else if (key == "pushToTalk") {
+                audio.pushToTalk = value == "1" || value == "true";
+            } else if (key == "pushToTalkVirtualKey") {
+                audio.pushToTalkVirtualKey = std::stoi(value);
+            }
+        } catch (...) {
+        }
+    }
+}
+
+void saveAudioSettings(const AudioSettings& audio) {
+    std::ofstream out(savedAudioSettingsPath(), std::ios::out | std::ios::trunc);
+    if (!out) {
+        return;
+    }
+
+    out << "inputDeviceName=" << audio.inputDeviceName << "\n";
+    out << "vadThreshold=" << audio.vadThreshold << "\n";
+    out << "inputGain=" << audio.inputGain << "\n";
+    out << "pushToTalk=" << (audio.pushToTalk ? 1 : 0) << "\n";
+    out << "pushToTalkVirtualKey=" << audio.pushToTalkVirtualKey << "\n";
 }
 
 std::optional<int> readVirtualKeyEnv(const char* name) {
@@ -114,6 +173,7 @@ private:
 
 int Application::run() {
     settings_.nick = "Host";
+    loadSavedAudioSettings(settings_.audio);
     if (const char* nick = std::getenv("TVO_NICK")) {
         settings_.nick = nick;
     }
@@ -135,6 +195,9 @@ int Application::run() {
         } catch (...) {
         }
     }
+    if (const char* inputDevice = std::getenv("TVO_INPUT_DEVICE")) {
+        settings_.audio.inputDeviceName = inputDevice;
+    }
     if (envFlagEnabled("TVO_PUSH_TO_TALK") || envFlagEnabled("TVO_PTT")) {
         settings_.audio.pushToTalk = true;
     }
@@ -144,7 +207,7 @@ int Application::run() {
         settings_.audio.pushToTalkVirtualKey = *key;
     }
 
-    if (!envFlagEnabled("TVO_SKIP_SETUP")) {
+    if (envFlagEnabled("TVO_SHOW_START_SETUP") && !envFlagEnabled("TVO_SKIP_SETUP")) {
         SetupWindow setup;
         const SetupResult profile = setup.showModal(settings_);
         if (!profile.accepted) {
@@ -271,6 +334,10 @@ int Application::run() {
 
     overlay_.create();
     overlay_.show();
+    tray_.create();
+    if (envFlagEnabled("TVO_SHOW_SETTINGS_ON_START")) {
+        tray_.requestSettings();
+    }
     hotkeys_.registerMuteHotkey(settings_.muteHotkey, [this] {
         session_.toggleLocalMute();
         voice_.setMuted(session_.localPeer().muted);
@@ -282,7 +349,7 @@ int Application::run() {
     auto lastOverlayRender = Clock::time_point{};
     bool smokeMuteTriggered = false;
 
-    while (!overlay_.closeRequested()) {
+    while (!tray_.exitRequested() && (tray_.created() || !overlay_.closeRequested())) {
         if (smokeExitMs && !smokeMuteTriggered) {
             const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                 Clock::now() - appStarted).count();
@@ -301,6 +368,11 @@ int Application::run() {
         }
 
         hotkeys_.poll();
+        if (tray_.consumeSettingsRequest()) {
+            audioSettingsWindow_.show(settings_.audio, [this](const AudioSettings& audioSettings) {
+                applyAudioSettings(audioSettings);
+            });
+        }
         signaling_.pump();
         lan_.pump();
         directVoice_.pump();
@@ -319,6 +391,8 @@ int Application::run() {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
+    audioSettingsWindow_.close();
+    tray_.destroy();
     voice_.stop();
     directVoice_.stop();
     signaling_.disconnect();
@@ -363,6 +437,24 @@ void Application::handleSignalingEvent(const SignalingEvent& event) {
     } else if (event.type == "error") {
         std::cerr << "signaling error: " << event.error << "\n";
     }
+}
+
+void Application::applyAudioSettings(const AudioSettings& audioSettings) {
+    const bool wasRunning = voice_.running();
+    const bool wasMuted = session_.localPeer().muted;
+
+    settings_.audio = audioSettings;
+    saveAudioSettings(settings_.audio);
+    voice_.setSettings(settings_.audio);
+
+    if (wasRunning) {
+        voice_.stop();
+        voice_.setSettings(settings_.audio);
+        voice_.start();
+        voice_.setMuted(wasMuted);
+    }
+
+    signaling_.broadcastStatus(session_.localPeer());
 }
 
 void Application::updateOverlay() {
