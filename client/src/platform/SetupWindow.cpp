@@ -14,6 +14,9 @@
 #include <commctrl.h>
 #include <mmsystem.h>
 
+#ifndef TBS_TRANSPARENTBKGND
+#define TBS_TRANSPARENTBKGND 0x1000
+#endif
 #ifndef VK_XBUTTON1
 #define VK_XBUTTON1 0x05
 #endif
@@ -46,6 +49,17 @@ constexpr int kTestStatus = 306;
 constexpr int kCheckPushToTalk = 307;
 constexpr int kButtonPushToTalkKey = 308;
 
+constexpr COLORREF kColorWindowTop = RGB(14, 19, 25);
+constexpr COLORREF kColorWindowBottom = RGB(20, 29, 36);
+constexpr COLORREF kColorPanel = RGB(28, 37, 46);
+constexpr COLORREF kColorPanelSoft = RGB(33, 44, 54);
+constexpr COLORREF kColorBorder = RGB(67, 87, 99);
+constexpr COLORREF kColorText = RGB(235, 242, 248);
+constexpr COLORREF kColorMutedText = RGB(153, 170, 181);
+constexpr COLORREF kColorAccent = RGB(74, 211, 190);
+constexpr COLORREF kColorAccentDark = RGB(20, 132, 123);
+constexpr COLORREF kColorEdit = RGB(18, 25, 32);
+
 struct IconChoice {
     const wchar_t* glyph;
     const wchar_t* name;
@@ -59,6 +73,47 @@ constexpr std::array<IconChoice, 5> kIcons{{
     {L"\xD83D\xDC3A", L"Волк", RGB(127, 140, 141)},
     {L"\xD83E\xDD89", L"Сова", RGB(125, 90, 181)},
 }};
+
+COLORREF blendColor(COLORREF from, COLORREF to, float t) {
+    const auto blend = [t](int a, int b) {
+        return static_cast<int>(static_cast<float>(a) + static_cast<float>(b - a) * t);
+    };
+    return RGB(
+        blend(GetRValue(from), GetRValue(to)),
+        blend(GetGValue(from), GetGValue(to)),
+        blend(GetBValue(from), GetBValue(to)));
+}
+
+void fillVerticalGradient(HDC hdc, RECT rect, COLORREF top, COLORREF bottom) {
+    const int height = std::max(1, static_cast<int>(rect.bottom - rect.top));
+    for (int y = rect.top; y < rect.bottom; ++y) {
+        const float t = static_cast<float>(y - rect.top) / static_cast<float>(height);
+        HPEN pen = CreatePen(PS_SOLID, 1, blendColor(top, bottom, t));
+        HGDIOBJ oldPen = SelectObject(hdc, pen);
+        MoveToEx(hdc, rect.left, y, nullptr);
+        LineTo(hdc, rect.right, y);
+        SelectObject(hdc, oldPen);
+        DeleteObject(pen);
+    }
+}
+
+void drawRoundRect(
+    HDC hdc,
+    RECT rect,
+    int radius,
+    COLORREF fill,
+    COLORREF border,
+    int borderWidth = 1) {
+    HBRUSH brush = CreateSolidBrush(fill);
+    HPEN pen = CreatePen(PS_SOLID, borderWidth, border);
+    HGDIOBJ oldBrush = SelectObject(hdc, brush);
+    HGDIOBJ oldPen = SelectObject(hdc, pen);
+    RoundRect(hdc, rect.left, rect.top, rect.right, rect.bottom, radius, radius);
+    SelectObject(hdc, oldPen);
+    SelectObject(hdc, oldBrush);
+    DeleteObject(pen);
+    DeleteObject(brush);
+}
 
 std::wstring toWide(const std::string& text) {
     if (text.empty()) {
@@ -356,8 +411,8 @@ public:
             WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            560,
-            650,
+            620,
+            700,
             nullptr,
             nullptr,
             GetModuleHandleW(nullptr),
@@ -401,13 +456,25 @@ private:
     LRESULT handle(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
         switch (message) {
         case WM_CREATE:
+            createVisualResources();
             createControls(hwnd);
             return 0;
+        case WM_ERASEBKGND:
+            return 1;
+        case WM_PAINT:
+            paintWindow();
+            return 0;
+        case WM_CTLCOLORSTATIC:
+            return colorStatic(reinterpret_cast<HDC>(wparam), reinterpret_cast<HWND>(lparam));
+        case WM_CTLCOLOREDIT:
+            return colorEdit(reinterpret_cast<HDC>(wparam));
+        case WM_CTLCOLORBTN:
+            return colorButton(reinterpret_cast<HDC>(wparam));
         case WM_COMMAND:
             handleCommand(LOWORD(wparam));
             return 0;
         case WM_DRAWITEM:
-            drawIconButton(reinterpret_cast<DRAWITEMSTRUCT*>(lparam));
+            drawOwnerButton(reinterpret_cast<DRAWITEMSTRUCT*>(lparam));
             return TRUE;
         case WM_HSCROLL:
             readSliders();
@@ -435,6 +502,7 @@ private:
             DestroyWindow(hwnd);
             return 0;
         case WM_DESTROY:
+            destroyVisualResources();
             done_ = true;
             return 0;
         default:
@@ -443,108 +511,227 @@ private:
         return DefWindowProcW(hwnd, message, wparam, lparam);
     }
 
-    void createControls(HWND hwnd) {
-        HFONT uiFont = reinterpret_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+    void createVisualResources() {
+        titleFont_ = CreateFontW(-30, 0, 0, 0, 700, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_OUTLINE_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY, VARIABLE_PITCH, L"Segoe UI Variable Display");
+        subtitleFont_ = CreateFontW(-15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_OUTLINE_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY, VARIABLE_PITCH, L"Segoe UI");
+        uiFont_ = CreateFontW(-16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_OUTLINE_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY, VARIABLE_PITCH, L"Segoe UI");
+        labelFont_ = CreateFontW(-14, 0, 0, 0, 600, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_OUTLINE_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY, VARIABLE_PITCH, L"Segoe UI");
+        buttonFont_ = CreateFontW(-16, 0, 0, 0, 700, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_OUTLINE_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY, VARIABLE_PITCH, L"Segoe UI");
 
-        auto setFont = [uiFont](HWND control) {
-            SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(uiFont), TRUE);
+        panelBrush_ = CreateSolidBrush(kColorPanel);
+        editBrush_ = CreateSolidBrush(kColorEdit);
+    }
+
+    void destroyVisualResources() {
+        if (titleFont_ != nullptr) {
+            DeleteObject(titleFont_);
+            titleFont_ = nullptr;
+        }
+        if (subtitleFont_ != nullptr) {
+            DeleteObject(subtitleFont_);
+            subtitleFont_ = nullptr;
+        }
+        if (uiFont_ != nullptr) {
+            DeleteObject(uiFont_);
+            uiFont_ = nullptr;
+        }
+        if (labelFont_ != nullptr) {
+            DeleteObject(labelFont_);
+            labelFont_ = nullptr;
+        }
+        if (buttonFont_ != nullptr) {
+            DeleteObject(buttonFont_);
+            buttonFont_ = nullptr;
+        }
+        if (panelBrush_ != nullptr) {
+            DeleteObject(panelBrush_);
+            panelBrush_ = nullptr;
+        }
+        if (editBrush_ != nullptr) {
+            DeleteObject(editBrush_);
+            editBrush_ = nullptr;
+        }
+    }
+
+    void paintWindow() const {
+        PAINTSTRUCT ps{};
+        HDC hdc = BeginPaint(hwnd_, &ps);
+        if (hdc == nullptr) {
+            return;
+        }
+
+        RECT rc{};
+        GetClientRect(hwnd_, &rc);
+        fillVerticalGradient(hdc, rc, kColorWindowTop, kColorWindowBottom);
+
+        RECT hero{24, 22, rc.right - 24, 112};
+        drawRoundRect(hdc, hero, 18, RGB(19, 28, 36), RGB(43, 148, 137), 1);
+
+        HBRUSH accentBrush = CreateSolidBrush(kColorAccent);
+        HGDIOBJ oldBrush = SelectObject(hdc, accentBrush);
+        HGDIOBJ oldPen = SelectObject(hdc, GetStockObject(NULL_PEN));
+        Ellipse(hdc, 46, 44, 92, 90);
+        SelectObject(hdc, oldPen);
+        SelectObject(hdc, oldBrush);
+        DeleteObject(accentBrush);
+
+        HPEN headsetPen = CreatePen(PS_SOLID, 4, RGB(15, 30, 36));
+        HGDIOBJ oldHeadsetPen = SelectObject(hdc, headsetPen);
+        Arc(hdc, 55, 52, 83, 82, 55, 69, 83, 69);
+        RoundRect(hdc, 52, 67, 61, 82, 6, 6);
+        RoundRect(hdc, 77, 67, 86, 82, 6, 6);
+        SelectObject(hdc, oldHeadsetPen);
+        DeleteObject(headsetPen);
+
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, kColorText);
+        HGDIOBJ oldFont = SelectObject(hdc, titleFont_);
+        RECT titleText{108, 35, rc.right - 48, 66};
+        DrawTextW(hdc, L"Tarkov Voice Overlay", -1, &titleText, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        SelectObject(hdc, subtitleFont_);
+        SetTextColor(hdc, kColorMutedText);
+        RECT subtitleText{110, 70, rc.right - 48, 96};
+        DrawTextW(hdc, L"Настройка голоса и оверлея перед рейдом", -1, &subtitleText, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        SelectObject(hdc, oldFont);
+
+        RECT identityPanel{24, 128, rc.right - 24, 292};
+        RECT audioPanel{24, 312, rc.right - 24, 558};
+        RECT footerPanel{24, 576, rc.right - 24, 638};
+        drawRoundRect(hdc, identityPanel, 16, kColorPanel, kColorBorder, 1);
+        drawRoundRect(hdc, audioPanel, 16, kColorPanel, kColorBorder, 1);
+        drawRoundRect(hdc, footerPanel, 16, RGB(21, 30, 38), RGB(45, 66, 77), 1);
+
+        SelectObject(hdc, labelFont_);
+        SetTextColor(hdc, kColorAccent);
+        TextOutW(hdc, 46, 142, L"Профиль", 7);
+        TextOutW(hdc, 46, 326, L"Аудио", 5);
+
+        SelectObject(hdc, oldFont);
+        EndPaint(hwnd_, &ps);
+    }
+
+    LRESULT colorStatic(HDC hdc, HWND control) const {
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, control == testStatus_ ? kColorAccent : kColorText);
+        return reinterpret_cast<LRESULT>(panelBrush_);
+    }
+
+    LRESULT colorEdit(HDC hdc) const {
+        SetBkMode(hdc, OPAQUE);
+        SetBkColor(hdc, kColorEdit);
+        SetTextColor(hdc, kColorText);
+        return reinterpret_cast<LRESULT>(editBrush_);
+    }
+
+    LRESULT colorButton(HDC hdc) const {
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, kColorText);
+        return reinterpret_cast<LRESULT>(panelBrush_);
+    }
+
+    void createControls(HWND hwnd) {
+        auto setFont = [this](HWND control, HFONT font = nullptr) {
+            SendMessageW(control, WM_SETFONT,
+                reinterpret_cast<WPARAM>(font != nullptr ? font : uiFont_), TRUE);
         };
 
-        HWND title = CreateWindowW(L"STATIC", L"Введите ник и выберите иконку",
-            WS_CHILD | WS_VISIBLE, 24, 18, 500, 22, hwnd, nullptr, nullptr, nullptr);
-        setFont(title);
-
         HWND nickLabel = CreateWindowW(L"STATIC", L"Ник",
-            WS_CHILD | WS_VISIBLE, 24, 58, 110, 22, hwnd, nullptr, nullptr, nullptr);
-        setFont(nickLabel);
+            WS_CHILD | WS_VISIBLE, 48, 173, 90, 22, hwnd, nullptr, nullptr, nullptr);
+        setFont(nickLabel, labelFont_);
 
         editNick_ = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", toWide(defaults_.nick).c_str(),
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-            148, 54, 260, 26, hwnd, reinterpret_cast<HMENU>(kEditNick), nullptr, nullptr);
+            116, 166, 260, 32, hwnd, reinterpret_cast<HMENU>(kEditNick), nullptr, nullptr);
         setFont(editNick_);
 
         HWND iconLabel = CreateWindowW(L"STATIC", L"Иконка",
-            WS_CHILD | WS_VISIBLE, 24, 102, 110, 22, hwnd, nullptr, nullptr, nullptr);
-        setFont(iconLabel);
+            WS_CHILD | WS_VISIBLE, 48, 218, 90, 22, hwnd, nullptr, nullptr, nullptr);
+        setFont(iconLabel, labelFont_);
 
         for (int i = 0; i < static_cast<int>(kIcons.size()); ++i) {
             HWND button = CreateWindowW(L"BUTTON", L"",
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
-                148, 96 + i * 32, 230, 28, hwnd,
+                116 + i * 92, 209, 82, 62, hwnd,
                 reinterpret_cast<HMENU>(static_cast<intptr_t>(kIconBase + i)),
                 nullptr, nullptr);
             setFont(button);
             iconButtons_[static_cast<std::size_t>(i)] = button;
         }
 
-        HWND micTitle = CreateWindowW(L"STATIC", L"Микрофон",
-            WS_CHILD | WS_VISIBLE, 24, 274, 120, 22, hwnd, nullptr, nullptr, nullptr);
-        setFont(micTitle);
-
         HWND sensitivityLabel = CreateWindowW(L"STATIC", L"Чувствительность",
-            WS_CHILD | WS_VISIBLE, 24, 310, 130, 22, hwnd, nullptr, nullptr, nullptr);
-        setFont(sensitivityLabel);
+            WS_CHILD | WS_VISIBLE, 48, 367, 150, 22, hwnd, nullptr, nullptr, nullptr);
+        setFont(sensitivityLabel, labelFont_);
 
         sensitivitySlider_ = CreateWindowExW(0, TRACKBAR_CLASSW, L"",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | TBS_NOTICKS,
-            166, 302, 250, 32, hwnd, reinterpret_cast<HMENU>(kSliderSensitivity), nullptr, nullptr);
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | TBS_NOTICKS | TBS_TRANSPARENTBKGND,
+            214, 358, 268, 34, hwnd, reinterpret_cast<HMENU>(kSliderSensitivity), nullptr, nullptr);
         SendMessageW(sensitivitySlider_, TBM_SETRANGE, TRUE, MAKELPARAM(0, 100));
         SendMessageW(sensitivitySlider_, TBM_SETPOS, TRUE, sensitivity_);
 
         sensitivityValue_ = CreateWindowW(L"STATIC", percentText(sensitivity_).c_str(),
-            WS_CHILD | WS_VISIBLE, 430, 310, 56, 22, hwnd,
+            WS_CHILD | WS_VISIBLE, 502, 366, 58, 22, hwnd,
             reinterpret_cast<HMENU>(kSensitivityValue), nullptr, nullptr);
-        setFont(sensitivityValue_);
+        setFont(sensitivityValue_, labelFont_);
 
         HWND volumeLabel = CreateWindowW(L"STATIC", L"Громкость микрофона",
-            WS_CHILD | WS_VISIBLE, 24, 352, 140, 22, hwnd, nullptr, nullptr, nullptr);
-        setFont(volumeLabel);
+            WS_CHILD | WS_VISIBLE, 48, 414, 160, 22, hwnd, nullptr, nullptr, nullptr);
+        setFont(volumeLabel, labelFont_);
 
         volumeSlider_ = CreateWindowExW(0, TRACKBAR_CLASSW, L"",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | TBS_NOTICKS,
-            166, 344, 250, 32, hwnd, reinterpret_cast<HMENU>(kSliderMicVolume), nullptr, nullptr);
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | TBS_NOTICKS | TBS_TRANSPARENTBKGND,
+            214, 405, 268, 34, hwnd, reinterpret_cast<HMENU>(kSliderMicVolume), nullptr, nullptr);
         SendMessageW(volumeSlider_, TBM_SETRANGE, TRUE, MAKELPARAM(0, 200));
         SendMessageW(volumeSlider_, TBM_SETPOS, TRUE, micVolume_);
 
         volumeValue_ = CreateWindowW(L"STATIC", percentText(micVolume_).c_str(),
-            WS_CHILD | WS_VISIBLE, 430, 352, 56, 22, hwnd,
+            WS_CHILD | WS_VISIBLE, 502, 413, 58, 22, hwnd,
             reinterpret_cast<HMENU>(kVolumeValue), nullptr, nullptr);
-        setFont(volumeValue_);
+        setFont(volumeValue_, labelFont_);
 
         HWND test = CreateWindowW(L"BUTTON", L"Тест: запись 2 сек",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-            166, 390, 160, 30, hwnd, reinterpret_cast<HMENU>(kButtonMicTest), nullptr, nullptr);
-        setFont(test);
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+            214, 457, 182, 38, hwnd, reinterpret_cast<HMENU>(kButtonMicTest), nullptr, nullptr);
+        setFont(test, buttonFont_);
 
         testStatus_ = CreateWindowW(L"STATIC", L"",
-            WS_CHILD | WS_VISIBLE, 340, 396, 170, 22, hwnd,
+            WS_CHILD | WS_VISIBLE, 416, 465, 150, 22, hwnd,
             reinterpret_cast<HMENU>(kTestStatus), nullptr, nullptr);
-        setFont(testStatus_);
+        setFont(testStatus_, labelFont_);
 
         pushToTalkCheck_ = CreateWindowW(L"BUTTON", L"Push-to-talk",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
-            166, 430, 160, 24, hwnd, reinterpret_cast<HMENU>(kCheckPushToTalk), nullptr, nullptr);
+            48, 512, 160, 24, hwnd, reinterpret_cast<HMENU>(kCheckPushToTalk), nullptr, nullptr);
         setFont(pushToTalkCheck_);
         SendMessageW(pushToTalkCheck_, BM_SETCHECK, pushToTalk_ ? BST_CHECKED : BST_UNCHECKED, 0);
 
         HWND pushToTalkLabel = CreateWindowW(L"STATIC", L"PTT key",
-            WS_CHILD | WS_VISIBLE, 166, 466, 70, 22, hwnd, nullptr, nullptr, nullptr);
-        setFont(pushToTalkLabel);
+            WS_CHILD | WS_VISIBLE, 245, 514, 70, 22, hwnd, nullptr, nullptr, nullptr);
+        setFont(pushToTalkLabel, labelFont_);
 
         pushToTalkKeyButton_ = CreateWindowW(L"BUTTON", virtualKeyLabel(pushToTalkVirtualKey_).c_str(),
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-            248, 460, 150, 30, hwnd, reinterpret_cast<HMENU>(kButtonPushToTalkKey), nullptr, nullptr);
-        setFont(pushToTalkKeyButton_);
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+            324, 504, 160, 38, hwnd, reinterpret_cast<HMENU>(kButtonPushToTalkKey), nullptr, nullptr);
+        setFont(pushToTalkKeyButton_, buttonFont_);
 
         HWND hint = CreateWindowW(L"STATIC",
             L"После старта окно скроется, а ник останется в углу.",
-            WS_CHILD | WS_VISIBLE, 24, 560, 420, 20, hwnd, nullptr, nullptr, nullptr);
-        setFont(hint);
+            WS_CHILD | WS_VISIBLE, 48, 600, 360, 22, hwnd, nullptr, nullptr, nullptr);
+        setFont(hint, subtitleFont_);
 
         HWND start = CreateWindowW(L"BUTTON", L"Старт",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-            420, 522, 90, 32, hwnd, reinterpret_cast<HMENU>(kButtonStart), nullptr, nullptr);
-        setFont(start);
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON | BS_OWNERDRAW,
+            432, 590, 134, 42, hwnd, reinterpret_cast<HMENU>(kButtonStart), nullptr, nullptr);
+        setFont(start, buttonFont_);
     }
 
     void handleCommand(int id) {
@@ -648,6 +835,59 @@ private:
         EnableWindow(GetDlgItem(hwnd_, kButtonMicTest), TRUE);
     }
 
+    void drawOwnerButton(DRAWITEMSTRUCT* item) const {
+        if (item == nullptr) {
+            return;
+        }
+
+        if (item->CtlID >= kIconBase &&
+            item->CtlID < kIconBase + static_cast<int>(kIcons.size())) {
+            drawIconButton(item);
+            return;
+        }
+
+        drawActionButton(item);
+    }
+
+    void drawActionButton(DRAWITEMSTRUCT* item) const {
+        HDC hdc = item->hDC;
+        RECT rc = item->rcItem;
+        const bool pressed = (item->itemState & ODS_SELECTED) != 0;
+        const bool disabled = (item->itemState & ODS_DISABLED) != 0;
+        const bool focused = (item->itemState & ODS_FOCUS) != 0;
+
+        COLORREF fill = kColorPanelSoft;
+        COLORREF border = kColorBorder;
+        COLORREF text = kColorText;
+        if (item->CtlID == kButtonStart) {
+            fill = pressed ? kColorAccentDark : kColorAccent;
+            border = RGB(116, 246, 224);
+            text = RGB(6, 25, 28);
+        } else if (item->CtlID == kButtonPushToTalkKey) {
+            fill = pressed ? RGB(35, 55, 65) : RGB(23, 34, 42);
+            border = RGB(82, 109, 123);
+        } else if (pressed) {
+            fill = RGB(40, 59, 69);
+        }
+
+        if (disabled) {
+            fill = RGB(30, 38, 45);
+            border = RGB(55, 65, 72);
+            text = RGB(120, 132, 140);
+        }
+
+        RECT buttonRect{rc.left + 1, rc.top + 1, rc.right - 1, rc.bottom - 1};
+        drawRoundRect(hdc, buttonRect, 14, fill, border, focused ? 2 : 1);
+
+        wchar_t textBuffer[96]{};
+        GetWindowTextW(item->hwndItem, textBuffer, static_cast<int>(sizeof(textBuffer) / sizeof(textBuffer[0])));
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, text);
+        HGDIOBJ oldFont = SelectObject(hdc, buttonFont_);
+        DrawTextW(hdc, textBuffer, -1, &buttonRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        SelectObject(hdc, oldFont);
+    }
+
     void drawIconButton(DRAWITEMSTRUCT* item) const {
         if (item == nullptr || item->CtlID < kIconBase ||
             item->CtlID >= kIconBase + static_cast<int>(kIcons.size())) {
@@ -659,30 +899,27 @@ private:
         const auto& icon = kIcons[static_cast<std::size_t>(index)];
         HDC hdc = item->hDC;
         RECT rc = item->rcItem;
+        const bool pressed = (item->itemState & ODS_SELECTED) != 0;
+        const bool focused = (item->itemState & ODS_FOCUS) != 0;
 
-        HBRUSH background = CreateSolidBrush(selected ? RGB(230, 239, 248) : RGB(248, 249, 250));
-        FillRect(hdc, &rc, background);
-        DeleteObject(background);
+        RECT card{rc.left + 1, rc.top + 1, rc.right - 1, rc.bottom - 1};
+        const COLORREF fill = selected
+            ? blendColor(icon.color, RGB(24, 34, 42), 0.60f)
+            : (pressed ? RGB(38, 51, 60) : RGB(24, 33, 41));
+        const COLORREF border = selected ? icon.color : (focused ? kColorAccent : RGB(49, 67, 78));
+        drawRoundRect(hdc, card, 16, fill, border, selected || focused ? 2 : 1);
 
-        HPEN border = CreatePen(PS_SOLID, selected ? 2 : 1, selected ? icon.color : RGB(210, 216, 222));
-        HGDIOBJ oldPen = SelectObject(hdc, border);
-        HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-        RoundRect(hdc, rc.left + 1, rc.top + 1, rc.right - 1, rc.bottom - 1, 8, 8);
-        SelectObject(hdc, oldBrush);
-        SelectObject(hdc, oldPen);
-        DeleteObject(border);
-
-        RECT circle{rc.left + 8, rc.top + 4, rc.left + 32, rc.top + 28};
+        RECT circle{rc.left + 24, rc.top + 8, rc.left + 58, rc.top + 42};
         HBRUSH iconBrush = CreateSolidBrush(icon.color);
-        oldBrush = SelectObject(hdc, iconBrush);
-        oldPen = SelectObject(hdc, GetStockObject(NULL_PEN));
+        HGDIOBJ oldBrush = SelectObject(hdc, iconBrush);
+        HGDIOBJ oldPen = SelectObject(hdc, GetStockObject(NULL_PEN));
         Ellipse(hdc, circle.left, circle.top, circle.right, circle.bottom);
         SelectObject(hdc, oldPen);
         SelectObject(hdc, oldBrush);
         DeleteObject(iconBrush);
 
         SetBkMode(hdc, TRANSPARENT);
-        HFONT emojiFont = CreateFontW(-15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        HFONT emojiFont = CreateFontW(-18, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
             DEFAULT_CHARSET, OUT_OUTLINE_PRECIS, CLIP_DEFAULT_PRECIS,
             CLEARTYPE_QUALITY, VARIABLE_PITCH, L"Segoe UI Emoji");
         HGDIOBJ oldFont = SelectObject(hdc, emojiFont);
@@ -690,11 +927,10 @@ private:
         SelectObject(hdc, oldFont);
         DeleteObject(emojiFont);
 
-        HFONT textFont = reinterpret_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
-        oldFont = SelectObject(hdc, textFont);
-        SetTextColor(hdc, RGB(24, 28, 34));
-        RECT textRect{rc.left + 44, rc.top + 5, rc.right - 8, rc.bottom - 4};
-        DrawTextW(hdc, icon.name, -1, &textRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        oldFont = SelectObject(hdc, labelFont_);
+        SetTextColor(hdc, selected ? RGB(245, 250, 252) : kColorMutedText);
+        RECT textRect{rc.left + 5, rc.top + 41, rc.right - 5, rc.bottom - 5};
+        DrawTextW(hdc, icon.name, -1, &textRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         SelectObject(hdc, oldFont);
     }
 
@@ -740,6 +976,13 @@ private:
     HWND testStatus_ = nullptr;
     HWND pushToTalkCheck_ = nullptr;
     HWND pushToTalkKeyButton_ = nullptr;
+    HFONT titleFont_ = nullptr;
+    HFONT subtitleFont_ = nullptr;
+    HFONT uiFont_ = nullptr;
+    HFONT labelFont_ = nullptr;
+    HFONT buttonFont_ = nullptr;
+    HBRUSH panelBrush_ = nullptr;
+    HBRUSH editBrush_ = nullptr;
     std::array<HWND, 5> iconButtons_{};
     bool capturingPushToTalkKey_ = false;
     bool done_ = false;
