@@ -207,7 +207,7 @@ int Application::run() {
         settings_.audio.pushToTalkVirtualKey = *key;
     }
 
-    if (envFlagEnabled("TVO_SHOW_START_SETUP") && !envFlagEnabled("TVO_SKIP_SETUP")) {
+    if (!envFlagEnabled("TVO_SKIP_SETUP")) {
         SetupWindow setup;
         const SetupResult profile = setup.showModal(settings_);
         if (!profile.accepted) {
