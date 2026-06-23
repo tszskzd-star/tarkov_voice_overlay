@@ -174,7 +174,37 @@ void paintOverlay(HWND hwnd, OverlayWindow* overlay) {
         DeleteObject(iconFont);
 
         std::wstring line = toWide(row.nick);
-        TextOutW(hdc, 60, y + 4, line.c_str(), static_cast<int>(line.size()));
+        SIZE textSize{};
+        GetTextExtentPoint32W(hdc, line.c_str(), static_cast<int>(line.size()), &textSize);
+
+        const RECT closeRect = closeRectFor(hwnd);
+        const int nameLeft = 58;
+        const int maxNameRight = y < 42 ? closeRect.left - 6 : rc.right - 12;
+        const int preferredNameRight = nameLeft + textSize.cx + 28;
+        RECT namePill{
+            nameLeft,
+            y - 4,
+            std::clamp(preferredNameRight, nameLeft + 68, maxNameRight),
+            y + 30};
+
+        HBRUSH nameBrush = CreateSolidBrush(row.muted ? RGB(40, 33, 37) : RGB(22, 47, 52));
+        HPEN namePen = CreatePen(PS_SOLID, 1, row.muted ? RGB(122, 73, 78) : RGB(74, 211, 190));
+        HGDIOBJ oldNameBrush = SelectObject(hdc, nameBrush);
+        HGDIOBJ oldNamePen = SelectObject(hdc, namePen);
+        RoundRect(hdc, namePill.left, namePill.top, namePill.right, namePill.bottom, 28, 28);
+        SelectObject(hdc, oldNamePen);
+        SelectObject(hdc, oldNameBrush);
+        DeleteObject(namePen);
+        DeleteObject(nameBrush);
+
+        RECT nameText{
+            namePill.left + 13,
+            namePill.top,
+            namePill.right - 13,
+            namePill.bottom};
+        SetTextColor(hdc, row.muted ? RGB(190, 150, 154) : RGB(235, 242, 250));
+        DrawTextW(hdc, line.c_str(), -1, &nameText,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
         y += kOverlayRowHeight;
     }

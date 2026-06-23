@@ -349,7 +349,7 @@ int Application::run() {
     auto lastOverlayRender = Clock::time_point{};
     bool smokeMuteTriggered = false;
 
-    while (!tray_.exitRequested() && (tray_.created() || !overlay_.closeRequested())) {
+    while (!tray_.exitRequested() && !overlay_.closeRequested()) {
         if (smokeExitMs && !smokeMuteTriggered) {
             const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                 Clock::now() - appStarted).count();
