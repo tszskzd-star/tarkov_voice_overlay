@@ -62,6 +62,7 @@ private:
         std::uint32_t lastSequence = 0;
         bool hasLastSequence = false;
         bool playbackPrimed = false;
+        void* opusDecoder = nullptr;
     };
 
     void pumpRemotePlayback();
@@ -74,6 +75,7 @@ private:
     int micLogCounter_ = 0;
     NativeAudioCapture* nativeCapture_ = nullptr;
     NativeAudioPlayback* nativePlayback_ = nullptr;
+    void* opusEncoder_ = nullptr;
     bool running_ = false;
     std::uint32_t sequence_ = 0;
     int transmitHangoverFrames_ = 0;

@@ -12,6 +12,14 @@
 #include <utility>
 #include <vector>
 
+#ifdef TVO_HAVE_OPUS
+#if __has_include(<opus/opus.h>)
+#include <opus/opus.h>
+#else
+#include <opus.h>
+#endif
+#endif
+
 #ifdef TVO_PLATFORM_WINDOWS
 #include <windows.h>
 #include <mmdeviceapi.h>
@@ -24,9 +32,11 @@ namespace tvo {
 
 namespace {
 
-constexpr int kWireVoiceSampleRate = 24000;
+constexpr int kWireVoiceSampleRate = 16000;
 constexpr int kWireVoiceFrameMs = 20;
 constexpr int kWireVoiceSamplesPerFrame = kWireVoiceSampleRate * kWireVoiceFrameMs / 1000;
+constexpr int kOpusSilkBitrateBps = 24000;
+constexpr int kOpusComplexity = 5;
 constexpr int kPreSpeechFrameCount = 6;
 constexpr int kVadHangoverPumpFrames = 28;
 constexpr int kPushToTalkTailPumpFrames = 8;
@@ -37,6 +47,7 @@ constexpr std::size_t kMaxPendingPlaybackBuffers = 24;
 constexpr float kSoftLimitKnee = 0.82f;
 constexpr float kSoftLimitCeiling = 0.98f;
 constexpr float kRemoteMixPeakTarget = 28000.0f;
+constexpr std::array<std::uint8_t, 4> kOpusMagic{'T', 'V', 'O', '1'};
 constexpr std::array<std::uint8_t, 4> kPcmMagic{'T', 'V', 'P', '1'};
 constexpr std::array<std::uint8_t, 4> kAdpcmMagic{'T', 'V', 'A', '1'};
 constexpr std::array<int, 16> kImaIndexTable{
@@ -97,6 +108,11 @@ bool lowBandwidthCodecEnabled() {
     if (value == nullptr) {
         value = std::getenv("TVO_LOW_BANDWIDTH_CODEC");
     }
+    return value != nullptr && std::string(value) == "1";
+}
+
+bool opusCodecDisabled() {
+    const char* value = std::getenv("TVO_DISABLE_OPUS_CODEC");
     return value != nullptr && std::string(value) == "1";
 }
 
@@ -207,6 +223,147 @@ std::vector<std::uint8_t> encodeAdpcmPayload(const std::vector<std::int16_t>& in
     return out;
 }
 
+#ifdef TVO_HAVE_OPUS
+OpusEncoder* ensureOpusEncoder(void*& encoder) {
+    if (encoder != nullptr) {
+        return static_cast<OpusEncoder*>(encoder);
+    }
+
+    int error = OPUS_OK;
+    auto* created = opus_encoder_create(kWireVoiceSampleRate, 1, OPUS_APPLICATION_VOIP, &error);
+    if (error != OPUS_OK || created == nullptr) {
+        appendVoiceLog("opus encoder create failed: " + std::to_string(error));
+        return nullptr;
+    }
+
+    opus_encoder_ctl(created, OPUS_SET_BITRATE(kOpusSilkBitrateBps));
+    opus_encoder_ctl(created, OPUS_SET_COMPLEXITY(kOpusComplexity));
+    opus_encoder_ctl(created, OPUS_SET_SIGNAL(OPUS_SIGNAL_VOICE));
+    opus_encoder_ctl(created, OPUS_SET_BANDWIDTH(OPUS_BANDWIDTH_WIDEBAND));
+    opus_encoder_ctl(created, OPUS_SET_VBR(0));
+    opus_encoder_ctl(created, OPUS_SET_PACKET_LOSS_PERC(5));
+    encoder = created;
+    appendVoiceLog("opus silk encoder ready bitrate=24000 complexity=5 sample_rate=16000");
+    return created;
+}
+
+OpusDecoder* ensureOpusDecoder(void*& decoder) {
+    if (decoder != nullptr) {
+        return static_cast<OpusDecoder*>(decoder);
+    }
+
+    int error = OPUS_OK;
+    auto* created = opus_decoder_create(kWireVoiceSampleRate, 1, &error);
+    if (error != OPUS_OK || created == nullptr) {
+        appendVoiceLog("opus decoder create failed: " + std::to_string(error));
+        return nullptr;
+    }
+
+    decoder = created;
+    return created;
+}
+
+void destroyOpusEncoder(void*& encoder) {
+    if (encoder != nullptr) {
+        opus_encoder_destroy(static_cast<OpusEncoder*>(encoder));
+        encoder = nullptr;
+    }
+}
+
+void destroyOpusDecoder(void*& decoder) {
+    if (decoder != nullptr) {
+        opus_decoder_destroy(static_cast<OpusDecoder*>(decoder));
+        decoder = nullptr;
+    }
+}
+
+std::vector<std::uint8_t> encodeOpusPayload(
+    const std::vector<std::int16_t>& input,
+    void*& encoder) {
+    auto* opus = ensureOpusEncoder(encoder);
+    const auto samples = normalizeFrameSamples(input);
+    if (opus == nullptr || samples.empty()) {
+        return {};
+    }
+
+    std::array<std::uint8_t, 512> packet{};
+    const int encodedBytes = opus_encode(
+        opus,
+        samples.data(),
+        kWireVoiceSamplesPerFrame,
+        packet.data(),
+        static_cast<opus_int32>(packet.size()));
+    if (encodedBytes <= 0) {
+        appendVoiceLog("opus encode failed: " + std::to_string(encodedBytes));
+        return {};
+    }
+
+    std::vector<std::uint8_t> out;
+    out.reserve(6 + static_cast<std::size_t>(encodedBytes));
+    out.insert(out.end(), kOpusMagic.begin(), kOpusMagic.end());
+    appendLeU16(out, static_cast<std::uint16_t>(kWireVoiceSamplesPerFrame));
+    out.insert(out.end(), packet.begin(), packet.begin() + encodedBytes);
+    return out;
+}
+
+bool decodeOpusPayload(
+    const std::vector<std::uint8_t>& payload,
+    void*& decoder,
+    std::vector<std::int16_t>& out) {
+    if (payload.size() < 7 ||
+        !std::equal(kOpusMagic.begin(), kOpusMagic.end(), payload.begin())) {
+        return false;
+    }
+
+    auto* opus = ensureOpusDecoder(decoder);
+    if (opus == nullptr) {
+        return false;
+    }
+
+    const std::uint16_t sampleCount = readLeU16(payload, 4);
+    if (sampleCount == 0 || sampleCount > kWireVoiceSamplesPerFrame * 3) {
+        return false;
+    }
+
+    out.assign(sampleCount, 0);
+    const int decoded = opus_decode(
+        opus,
+        payload.data() + 6,
+        static_cast<opus_int32>(payload.size() - 6),
+        out.data(),
+        static_cast<int>(out.size()),
+        0);
+    if (decoded <= 0) {
+        appendVoiceLog("opus decode failed: " + std::to_string(decoded));
+        out.clear();
+        return false;
+    }
+    out.resize(static_cast<std::size_t>(decoded));
+    return true;
+}
+#else
+void destroyOpusEncoder(void*& encoder) {
+    encoder = nullptr;
+}
+
+void destroyOpusDecoder(void*& decoder) {
+    decoder = nullptr;
+}
+
+std::vector<std::uint8_t> encodeOpusPayload(
+    const std::vector<std::int16_t>&,
+    void*&) {
+    return {};
+}
+
+bool decodeOpusPayload(
+    const std::vector<std::uint8_t>&,
+    void*&,
+    std::vector<std::int16_t>&) {
+    return false;
+}
+#endif
+
 std::vector<std::uint8_t> encodePcmPayload(const std::vector<std::int16_t>& input) {
     const auto samples = normalizeFrameSamples(input);
     if (samples.empty() || samples.size() > 0xffff) {
@@ -282,8 +439,14 @@ bool decodeAdpcmPayload(const std::vector<std::uint8_t>& payload, std::vector<st
     return out.size() == sampleCount;
 }
 
-std::vector<std::int16_t> decodeVoicePayload(const std::vector<std::uint8_t>& payload) {
+std::vector<std::int16_t> decodeVoicePayload(
+    const std::vector<std::uint8_t>& payload,
+    void*& opusDecoder) {
     std::vector<std::int16_t> samples;
+    if (decodeOpusPayload(payload, opusDecoder, samples)) {
+        return normalizeFrameSamples(samples);
+    }
+
     if (decodePcmPayload(payload, samples)) {
         return normalizeFrameSamples(samples);
     }
@@ -1016,6 +1179,10 @@ bool VoiceEngine::start() {
     pushToTalkActive_ = false;
     transmitting_ = false;
     preSpeechFrames_.clear();
+    destroyOpusEncoder(opusEncoder_);
+    for (auto& [_, state] : remoteAudio_) {
+        destroyOpusDecoder(state.opusDecoder);
+    }
     remoteAudio_.clear();
     lastRemoteMix_ = Clock::time_point{};
     remoteMixGain_ = 1.0f;
@@ -1053,6 +1220,10 @@ void VoiceEngine::stop() {
         nativePlayback_->stop();
         delete nativePlayback_;
         nativePlayback_ = nullptr;
+    }
+    destroyOpusEncoder(opusEncoder_);
+    for (auto& [_, state] : remoteAudio_) {
+        destroyOpusDecoder(state.opusDecoder);
     }
     metrics_.micLevel = 0.0f;
     metrics_.spectrum.fill(0.0f);
@@ -1101,6 +1272,7 @@ void VoiceEngine::pumpRemotePlayback() {
     for (auto it = remoteAudio_.begin(); it != remoteAudio_.end();) {
         auto& state = it->second;
         if (state.frames.empty() && now - state.lastReceived > std::chrono::seconds(2)) {
+            destroyOpusDecoder(state.opusDecoder);
             it = remoteAudio_.erase(it);
             continue;
         }
@@ -1230,10 +1402,15 @@ void VoiceEngine::pump() {
         EncodedVoiceFrame frame;
         frame.sequence = sequence_++;
         frame.captureUnixMs = elapsed;
-        if (!lowBandwidthCodecEnabled()) {
-            frame.payload = encodePcmPayload(pcmFrame);
-        } else {
+        if (lowBandwidthCodecEnabled()) {
             frame.payload = encodeAdpcmPayload(pcmFrame);
+        } else if (!opusCodecDisabled()) {
+            frame.payload = encodeOpusPayload(pcmFrame, opusEncoder_);
+            if (frame.payload.empty()) {
+                frame.payload = encodePcmPayload(pcmFrame);
+            }
+        } else {
+            frame.payload = encodePcmPayload(pcmFrame);
         }
         if (frame.payload.empty()) {
             metrics_.droppedFrames += 1;
@@ -1299,7 +1476,7 @@ void VoiceEngine::playRemoteFrame(const EncodedVoiceFrame& frame) {
     remote.lastSequence = frame.sequence;
     remote.lastReceived = Clock::now();
 
-    std::vector<std::int16_t> pcm = decodeVoicePayload(frame.payload);
+    std::vector<std::int16_t> pcm = decodeVoicePayload(frame.payload, remote.opusDecoder);
     if (pcm.empty()) {
         metrics_.droppedFrames += 1;
         return;

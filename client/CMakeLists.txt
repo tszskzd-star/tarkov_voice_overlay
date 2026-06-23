@@ -23,6 +23,33 @@ endif()
 target_compile_features(tarkov_voice_overlay PRIVATE cxx_std_20)
 target_include_directories(tarkov_voice_overlay PRIVATE include)
 
+if(TVO_ENABLE_OPUS)
+    find_package(Opus CONFIG QUIET)
+    if(Opus_FOUND)
+        if(TARGET Opus::opus)
+            target_link_libraries(tarkov_voice_overlay PRIVATE Opus::opus)
+        elseif(TARGET opus)
+            target_link_libraries(tarkov_voice_overlay PRIVATE opus)
+        elseif(TARGET unofficial::opus::opus)
+            target_link_libraries(tarkov_voice_overlay PRIVATE unofficial::opus::opus)
+        endif()
+        target_compile_definitions(tarkov_voice_overlay PRIVATE TVO_HAVE_OPUS=1)
+    else()
+        include(FetchContent)
+        set(OPUS_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
+        set(OPUS_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+        set(OPUS_INSTALL_PKG_CONFIG_MODULE OFF CACHE BOOL "" FORCE)
+        set(OPUS_INSTALL_CMAKE_CONFIG_MODULE OFF CACHE BOOL "" FORCE)
+        FetchContent_Declare(tvo_opus
+            URL https://github.com/xiph/opus/releases/download/v1.5.2/opus-1.5.2.tar.gz
+            TLS_VERIFY FALSE
+            URL_HASH SHA256=65c1d2f78b9f2fb20082c38cbe47c951ad5839345876e46941612ee87f9a7ce1)
+        FetchContent_MakeAvailable(tvo_opus)
+        target_link_libraries(tarkov_voice_overlay PRIVATE opus)
+        target_compile_definitions(tarkov_voice_overlay PRIVATE TVO_HAVE_OPUS=1)
+    endif()
+endif()
+
 if(WIN32)
     target_compile_definitions(tarkov_voice_overlay PRIVATE
         NOMINMAX
