@@ -61,6 +61,7 @@ private:
         Clock::time_point lastReceived = Clock::now();
         std::uint32_t lastSequence = 0;
         bool hasLastSequence = false;
+        bool playbackPrimed = false;
     };
 
     void pumpRemotePlayback();

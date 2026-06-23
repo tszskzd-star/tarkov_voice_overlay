@@ -30,12 +30,14 @@ constexpr int kWireVoiceSamplesPerFrame = kWireVoiceSampleRate * kWireVoiceFrame
 constexpr int kPreSpeechFrameCount = 6;
 constexpr int kVadHangoverPumpFrames = 28;
 constexpr int kPushToTalkTailPumpFrames = 8;
-constexpr int kRemotePlaybackIntervalMs = 18;
-constexpr std::size_t kMaxRemoteFramesPerPeer = 6;
-constexpr std::size_t kMaxPendingPlaybackBuffers = 18;
+constexpr int kRemotePlaybackIntervalMs = kWireVoiceFrameMs;
+constexpr std::size_t kRemoteJitterTargetFrames = 2;
+constexpr std::size_t kMaxRemoteFramesPerPeer = 12;
+constexpr std::size_t kMaxPendingPlaybackBuffers = 24;
 constexpr float kSoftLimitKnee = 0.82f;
 constexpr float kSoftLimitCeiling = 0.98f;
 constexpr float kRemoteMixPeakTarget = 28000.0f;
+constexpr std::array<std::uint8_t, 4> kPcmMagic{'T', 'V', 'P', '1'};
 constexpr std::array<std::uint8_t, 4> kAdpcmMagic{'T', 'V', 'A', '1'};
 constexpr std::array<int, 16> kImaIndexTable{
     -1, -1, -1, -1, 2, 4, 6, 8,
@@ -90,8 +92,11 @@ bool audibleVoiceFrame(const std::vector<std::int16_t>& samples) {
     return peak >= 900 || rms >= 260.0;
 }
 
-bool voiceCodecDisabled() {
-    const char* value = std::getenv("TVO_DISABLE_VOICE_CODEC");
+bool lowBandwidthCodecEnabled() {
+    const char* value = std::getenv("TVO_USE_ADPCM_CODEC");
+    if (value == nullptr) {
+        value = std::getenv("TVO_LOW_BANDWIDTH_CODEC");
+    }
     return value != nullptr && std::string(value) == "1";
 }
 
@@ -202,6 +207,38 @@ std::vector<std::uint8_t> encodeAdpcmPayload(const std::vector<std::int16_t>& in
     return out;
 }
 
+std::vector<std::uint8_t> encodePcmPayload(const std::vector<std::int16_t>& input) {
+    const auto samples = normalizeFrameSamples(input);
+    if (samples.empty() || samples.size() > 0xffff) {
+        return {};
+    }
+
+    std::vector<std::uint8_t> out;
+    out.reserve(6 + samples.size() * sizeof(std::int16_t));
+    out.insert(out.end(), kPcmMagic.begin(), kPcmMagic.end());
+    appendLeU16(out, static_cast<std::uint16_t>(samples.size()));
+    const auto* bytes = reinterpret_cast<const std::uint8_t*>(samples.data());
+    out.insert(out.end(), bytes, bytes + samples.size() * sizeof(std::int16_t));
+    return out;
+}
+
+bool decodePcmPayload(const std::vector<std::uint8_t>& payload, std::vector<std::int16_t>& out) {
+    if (payload.size() < 6 ||
+        !std::equal(kPcmMagic.begin(), kPcmMagic.end(), payload.begin())) {
+        return false;
+    }
+
+    const std::uint16_t sampleCount = readLeU16(payload, 4);
+    const std::size_t expectedBytes = 6 + static_cast<std::size_t>(sampleCount) * sizeof(std::int16_t);
+    if (sampleCount == 0 || payload.size() != expectedBytes) {
+        return false;
+    }
+
+    out.resize(sampleCount);
+    std::memcpy(out.data(), payload.data() + 6, sampleCount * sizeof(std::int16_t));
+    return true;
+}
+
 bool decodeAdpcmPayload(const std::vector<std::uint8_t>& payload, std::vector<std::int16_t>& out) {
     if (payload.size() < 9 ||
         !std::equal(kAdpcmMagic.begin(), kAdpcmMagic.end(), payload.begin())) {
@@ -247,6 +284,10 @@ bool decodeAdpcmPayload(const std::vector<std::uint8_t>& payload, std::vector<st
 
 std::vector<std::int16_t> decodeVoicePayload(const std::vector<std::uint8_t>& payload) {
     std::vector<std::int16_t> samples;
+    if (decodePcmPayload(payload, samples)) {
+        return normalizeFrameSamples(samples);
+    }
+
     if (decodeAdpcmPayload(payload, samples)) {
         return normalizeFrameSamples(samples);
     }
@@ -872,8 +913,7 @@ struct VoiceEngine::NativeAudioPlayback {
 
         cleanup(false);
         if (pending_.size() >= kMaxPendingPlaybackBuffers) {
-            waveOutReset(handle_);
-            cleanup(true);
+            return;
         }
 
         auto pending = std::make_unique<PendingBuffer>();
@@ -892,9 +932,7 @@ struct VoiceEngine::NativeAudioPlayback {
             pending_.push_back(std::move(pending));
         }
 
-        if (pending_.size() > kMaxPendingPlaybackBuffers) {
-            cleanup(true);
-        }
+        cleanup(false);
     }
 
     ~NativeAudioPlayback() {
@@ -1068,6 +1106,11 @@ void VoiceEngine::pumpRemotePlayback() {
         }
 
         if (!state.frames.empty()) {
+            if (!state.playbackPrimed && state.frames.size() < kRemoteJitterTargetFrames) {
+                ++it;
+                continue;
+            }
+            state.playbackPrimed = true;
             auto frame = std::move(state.frames.front());
             state.frames.pop_front();
             if (!audibleVoiceFrame(frame)) {
@@ -1079,6 +1122,8 @@ void VoiceEngine::pumpRemotePlayback() {
                 mixed[i] += frame[i];
             }
             ++activeFrames;
+        } else {
+            state.playbackPrimed = false;
         }
         ++it;
     }
@@ -1185,10 +1230,8 @@ void VoiceEngine::pump() {
         EncodedVoiceFrame frame;
         frame.sequence = sequence_++;
         frame.captureUnixMs = elapsed;
-        if (voiceCodecDisabled()) {
-            const auto samples = normalizeFrameSamples(pcmFrame);
-            frame.payload.resize(samples.size() * sizeof(std::int16_t));
-            std::memcpy(frame.payload.data(), samples.data(), frame.payload.size());
+        if (!lowBandwidthCodecEnabled()) {
+            frame.payload = encodePcmPayload(pcmFrame);
         } else {
             frame.payload = encodeAdpcmPayload(pcmFrame);
         }
