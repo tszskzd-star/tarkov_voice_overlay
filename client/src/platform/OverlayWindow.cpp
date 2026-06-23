@@ -187,15 +187,13 @@ void paintOverlay(HWND hwnd, OverlayWindow* overlay) {
             std::clamp(preferredNameRight, nameLeft + 68, maxNameRight),
             y + 30};
 
-        HBRUSH nameBrush = CreateSolidBrush(row.muted ? RGB(40, 33, 37) : RGB(22, 47, 52));
         HPEN namePen = CreatePen(PS_SOLID, 1, row.muted ? RGB(122, 73, 78) : RGB(74, 211, 190));
-        HGDIOBJ oldNameBrush = SelectObject(hdc, nameBrush);
+        HGDIOBJ oldNameBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
         HGDIOBJ oldNamePen = SelectObject(hdc, namePen);
         RoundRect(hdc, namePill.left, namePill.top, namePill.right, namePill.bottom, 28, 28);
         SelectObject(hdc, oldNamePen);
         SelectObject(hdc, oldNameBrush);
         DeleteObject(namePen);
-        DeleteObject(nameBrush);
 
         RECT nameText{
             namePill.left + 13,
