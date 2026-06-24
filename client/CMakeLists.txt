@@ -65,6 +65,23 @@ if(WIN32)
         user32
         shell32
         ws2_32)
+
+    if(MINGW)
+        get_filename_component(TVO_MINGW_BIN_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
+        foreach(TVO_RUNTIME_DLL
+            libgcc_s_seh-1.dll
+            libssp-0.dll
+            libstdc++-6.dll
+            libwinpthread-1.dll)
+            if(EXISTS "${TVO_MINGW_BIN_DIR}/${TVO_RUNTIME_DLL}")
+                add_custom_command(TARGET tarkov_voice_overlay POST_BUILD
+                    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                        "${TVO_MINGW_BIN_DIR}/${TVO_RUNTIME_DLL}"
+                        "$<TARGET_FILE_DIR:tarkov_voice_overlay>/${TVO_RUNTIME_DLL}"
+                    VERBATIM)
+            endif()
+        endforeach()
+    endif()
 endif()
 
 if(TVO_ENABLE_NATIVE_BACKENDS)
